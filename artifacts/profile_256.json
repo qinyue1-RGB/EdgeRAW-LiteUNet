@@ -1,0 +1,23 @@
+[
+  {
+    "model": "Original UNet",
+    "params": 9763364,
+    "macs": 24142675968,
+    "flops": 48285351936,
+    "input_shape": "1x4x256x256"
+  },
+  {
+    "model": "LiteUNet-v1",
+    "params": 1441868,
+    "macs": 3323151360,
+    "flops": 6646302720,
+    "input_shape": "1x4x256x256"
+  },
+  {
+    "model": "LiteUNet-v2",
+    "params": 372540,
+    "macs": 919890432,
+    "flops": 1839780864,
+    "input_shape": "1x4x256x256"
+  }
+]

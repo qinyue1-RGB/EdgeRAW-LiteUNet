@@ -1,0 +1,4 @@
+model,params,macs,psnr,ssim,latency_ms,fps,device,input_shape,checkpoint,status
+Original UNet,9763364,24142675968,19.668922901153564,0.9137679189443588,6.009642333984375,166.39925380334623,NVIDIA GeForce RTX 5070 Ti Laptop GPU,1x4x256x256,,synthetic RAW smoke ablation; not an IMX766 camera benchmark
+LiteUNet-v1,1441868,3323151360,15.012939691543579,0.7405557185411453,3.793262634277344,263.62530001577665,NVIDIA GeForce RTX 5070 Ti Laptop GPU,1x4x256x256,,synthetic RAW smoke ablation; not an IMX766 camera benchmark
+LiteUNet-v2,372540,919890432,15.240617990493774,0.8925991505384445,2.833299255371094,352.9454215273226,NVIDIA GeForce RTX 5070 Ti Laptop GPU,1x4x256x256,,synthetic RAW smoke ablation; not an IMX766 camera benchmark

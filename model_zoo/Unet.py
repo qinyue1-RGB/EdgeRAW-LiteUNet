@@ -3,7 +3,6 @@ import os
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from thop import profile
 
 
 class Upsample2D(nn.Module):
@@ -175,6 +174,8 @@ class Unet(nn.Module):
 
 
 if __name__ == "__main__":
+    from thop import profile
+
     flops, params = profile(Unet(), inputs = (torch.randn(1, 4, 640, 960), ))
     print('MACs = ' + str(flops/1000**3) + 'G')
     print('Params = ' + str(params/1000**2) + 'M' )

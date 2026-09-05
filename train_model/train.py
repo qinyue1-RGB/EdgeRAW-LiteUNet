@@ -6,6 +6,13 @@
 
 
 import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import torch
 import torch.optim as optim
 import torch.nn as nn
@@ -17,10 +24,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from torch.utils.tensorboard import SummaryWriter
 from warmup_scheduler import GradualWarmupScheduler
 import logging
-import importlib
+from model_zoo.registry import create_model
 from make_dataloader import Trainset, Validset
 import argparse
-from pathlib import Path
 from utils.tools import reduce_mean, set_random_seed, set_config, calculate_psnr, calculate_ssim, Charbon_loss, simple_isp, save_valid_image
 from torch.quantization.quantize_fx import prepare_fx, convert_fx
 from torch.ao.quantization.fx.graph_module import ObservedGraphModule
@@ -108,9 +114,7 @@ class Trainer(object):
         """
         set model
         """
-        m = self.args['network']
-        network = importlib.import_module(f'model_zoo.{m}')
-        self.network = getattr(network, m)() if hasattr(network, m) else None
+        self.network = create_model(self.args['network'])
         
     
     def __set_save_log(self) -> None:
@@ -186,8 +190,11 @@ class Trainer(object):
         """
         set train dataloader
         """
-        train_sampler = DistributedSampler(Trainset())
-        train_loader = torch.utils.data.DataLoader(Trainset(),
+        train_dataset = Trainset()
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True
+        )
+        train_loader = torch.utils.data.DataLoader(train_dataset,
                                                     batch_size=self.args['train_batch_size'],
                                                     num_workers=self.args['train_num_workers'],
                                                     pin_memory=True,
@@ -221,6 +228,7 @@ class Trainer(object):
         """
         set warmup
         """
+        self.warmup = None
         if self.args['use_warm_up']:
             self.warmup =  GradualWarmupScheduler(self.optimizer, multiplier=1, total_epoch=3, after_scheduler=self.lr_scheduler)
             
@@ -246,15 +254,27 @@ class Trainer(object):
         """
         set ddp
         """
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--local_rank", type=int)
-        pars = parser.parse_args()
-        torch.cuda.set_device(pars.local_rank)
-        device=torch.device("cuda", pars.local_rank)
-        dist.init_process_group(backend = 'nccl')
-        self.network.to(device)
-        self.network = DDP(self.network, device_ids = [pars.local_rank], output_device= pars.local_rank, find_unused_parameters=True)
-        set_random_seed(self.args['seed'] + pars.local_rank)
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--local_rank", "--local-rank", type=int, default=0)
+        pars, _ = parser.parse_known_args()
+        self.local_rank = int(os.environ.get("LOCAL_RANK", pars.local_rank))
+        self.rank = int(os.environ.get("RANK", 0))
+        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+        self.distributed = self.world_size > 1
+        if torch.cuda.is_available():
+            torch.cuda.set_device(self.local_rank)
+            self.device = torch.device("cuda", self.local_rank)
+        else:
+            self.device = torch.device("cpu")
+        self.network.to(self.device)
+        if self.distributed:
+            backend = "nccl" if dist.is_nccl_available() and os.name != "nt" else "gloo"
+            dist.init_process_group(backend=backend)
+            ddp_kwargs = {"find_unused_parameters": True}
+            if self.device.type == "cuda":
+                ddp_kwargs.update(device_ids=[self.local_rank], output_device=self.local_rank)
+            self.network = DDP(self.network, **ddp_kwargs)
+        set_random_seed(self.args['seed'] + self.rank)
 
         
     def __ddp_train_loop(self) -> None:
@@ -271,9 +291,11 @@ class Trainer(object):
             self.network.train()
             self.train_sampler.set_epoch(epoch)
             self.__ddp_train(epoch)
-            self.__valid(epoch) if dist.get_rank() == 0 else None
-            self.lr_scheduler.step()
-            self.warmup.step()
+            self.__valid(epoch) if self.rank == 0 else None
+            if self.warmup is not None:
+                self.warmup.step()
+            elif self.args['use_lr_scheduler']:
+                self.lr_scheduler.step()
             if self.args['use_tensorboard']:
                 self.writer.add_scalar('lr', self.optimizer.param_groups[0]['lr'], epoch)
   
@@ -284,15 +306,16 @@ class Trainer(object):
         """
         ave_loss = list()
         for step, (images, labels) in enumerate(self.train_loader):
-            images, labels = images.cuda(non_blocking=True), labels.cuda(non_blocking=True)
+            images = images.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
             self.optimizer.zero_grad()
             outputs = self.network(images)
             loss = self.criterion(outputs, labels)
-            loss = reduce_mean(loss, dist.get_world_size())
+            loss = reduce_mean(loss, self.world_size) if self.distributed else loss
             loss.backward()
             self.optimizer.step()
             ave_loss.append(loss.item())
-            if dist.get_rank() == 0:
+            if self.rank == 0:
                 if self.args['use_tensorboard']:
                     self.writer.add_scalar('train_loss', loss.item(), self.global_step)
                 if self.global_step % self.args['print_step'] == 0:
@@ -303,7 +326,7 @@ class Trainer(object):
             self.best_loss = ave_loss
             torch.save(self.network.module.state_dict() if hasattr(self.network, "module") else self.network.state_dict(),
                        os.path.join(self.checkpoint_dir, self.args['network'] + '_best_ckpt.pth'))
-        if epoch == self.args['train_epochs'] - 1 and dist.get_rank() == 0:
+        if epoch == self.args['train_epochs'] - 1 and self.rank == 0:
             # torch.save(self.network.state_dict(), os.path.join(self.checkpoint_dir, self.args['network'] + '_last_ckpt.pth'))
             # logging.info(f'model has been saved in {self.checkpoint_dir}')
             if self.args['use_quant']:
@@ -321,7 +344,7 @@ class Trainer(object):
         ave_psnr = list()
         ave_ssim = list()
         for step, (images, labels) in enumerate(self.val_loader):
-            images, labels = images.cuda(), labels.cuda()
+            images, labels = images.to(self.device), labels.to(self.device)
             outputs = self.network(images)
             psnr = calculate_psnr(outputs, labels)
             ssim = calculate_ssim(outputs, labels)
@@ -389,7 +412,14 @@ class Trainer(object):
 
 if __name__ == "__main__":
     root_path = Path(os.path.abspath(__file__)).parent.parent
-    config_path = root_path / 'train_model' / 'train_config.yaml'
+    parser = argparse.ArgumentParser(description="Train an AISP RAW denoising model")
+    parser.add_argument(
+        "--config",
+        default=str(root_path / 'train_model' / 'train_config.yaml'),
+        help="Path to a YAML training configuration",
+    )
+    cli_args, _ = parser.parse_known_args()
+    config_path = cli_args.config
     train_model = Trainer(train_config=config_path)
     train_model.run()
     

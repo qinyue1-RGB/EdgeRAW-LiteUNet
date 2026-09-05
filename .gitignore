@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+training/
+artifacts/training/
+*.pth
+*.pt
+*.onnx
+*.engine
+IMX766/train_data/
+IMX766/test_data/
+work/
+outputs/

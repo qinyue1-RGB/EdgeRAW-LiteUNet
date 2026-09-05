@@ -1,311 +1,386 @@
-# AISP_NR:  2D AI-Noise Reduction for RAW Images
-![pipe](assets/pipe.png)
-## 介绍
-这是一个关于AI-ISP模块：Noise Reduction 的工程实现文档，针对目标camera如（sensor：IMX766）梳理AI降噪的实现流程，该项目包含：数据准备、模型设计、模型训练、模型压缩、模型推理等。请先确保安装该项目的依赖项，通过git clone下载该项目，然后在该项目的根目录下执行以下命令安装依赖项。
+# EdgeRAW-LiteUNet
 
-```shell
-docker pull huiiji/ubuntu_torch1.13_python3.8:latest  #docker images约20G，请耐心下载
-docker run -it --gpus all -v /yourpath:/mnt huiiji/ubuntu_torch1.13_python3.8:latest /bin/bash   #/yourpath为你的根路径
-git clone https://github.com/HuiiJi/AISP_NR.git
-chmod -R 777 AISP_NR/
-cd AISP_NR
-```
-> *Tips: 该项目的依赖项包括pytorch、torchvision、numpy、opencv-python、pyyaml、tensorboard、torchsummary、torchsummaryX、torch2trt、onnx、onnxruntime等，你可以通过docker pull来下载镜像images并启动容器container来完成环境配置，docker的安装请参考[官方文档](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html#docker)。*
-## 0. 文件树
-```shell
-├── assets
-├── IMX766
-|   ├── black_img
-|   ├── calibrate_img
-|   ├── test_data
-|   ├── train_data
-├── infer_model
-|   ├── inference.py
-|   ├── infer_config.yaml
-├── train_model
-|   ├── training
-|       ├── tensorboard
-|       ├── log
-|       ├── checkpoints
-|   ├── run.sh
-|   ├── train_config.yaml
-|   ├── train.py
-|   ├── make_dataloader.py
-├── utils
-|   ├── tools.py
-|   ├── make_dataset.py
-|   ├── noise_profile.py
-├── demo.py
+轻量级 4-channel RAW 图像去噪 UNet：在同一套 AISP 训练接口中，对 Original UNet、Depthwise Separable Conv 和通道压缩进行可复现消融。
 
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)
+![Task](https://img.shields.io/badge/Task-RAW%20Denoising-6A5ACD)
+![License](https://img.shields.io/badge/License-MIT-green)
+
+- **任务**：RAW denoising，`4-channel RAW → 4-channel RAW`
+- **模型**：Original UNet / LiteUNet-v1 / LiteUNet-v2
+- **输出**：模型代码、统一配置、profiling、benchmark、CSV 和可再生成图表
+- **上游项目**：[HuiiJi/AISP](https://github.com/HuiiJi/AISP)；原始说明见 [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md)
+
+## Architecture Roadmap
+
+```text
+Original UNet                         32 → 64 → 128 → 256 → 512
+      │ replace suitable 3×3 Conv with DW 3×3 + PW 1×1
+      ▼
+LiteUNet-v1                          32 → 64 → 128 → 256 → 512
+      │ halve the main channel widths
+      ▼
+LiteUNet-v2                          16 → 32 → 64 → 128 → 256
 ```
 
-## 1. 数据准备
-AI降噪模型开发的第一步也是非常重要的一步，数据采集，训练数据分布与推理场景有较大的域差异则会显著降低降噪表现。
-以监督学习为例，监督学习需要成对的数据，即有噪声的图像和无噪声的图像，可以通过以下方式获得。
+所有版本保持相同的 encoder-decoder 层级、skip connection、残差 RAW 输出和输入输出通道。
 
-#### 1.1 Camera实拍成对数据
-实拍数据可来源于开源数据集，其提供了camera实拍成对的匹配数据，GT可以通过静止多帧平均、低ISO等方式得到，以下是一些开源数据集。
+## Headline Results
 
- |Dataset| URL  |Domain|  
- |:-----:|:-------:|:--:|
- |DND|[url](https://noise.visinf.tu-darmstadt.de/)                         |RAW   |
- |SID|[url](https://pan.baidu.com/s/1fk8EibhBe_M1qG0ax9LQZA#list/path=%2F) |RAW |
- |SIDD|[url](https://www.eecs.yorku.ca/~kamel/sidd/dataset.php)            |RAW+RGB    |                      
- |Renoir|[url](http://ani.stat.fsu.edu/~abarbu/Renoir.html)                |RAW    |
- |MIT-Adobe FiveK|[url](https://data.csail.mit.edu/graphics/fivek/)        |RAW+RGB    |
-    
-> *优点：实拍数据与推理场景的域差异较小，因此不需要进行数据增强，以及噪声标定，可以直接用于训练。* <br>
-> *缺点：数据集camera的噪声分布与推理场景有较大的域差异，通常不能直接应用于不同的camera，需要进一步处理，且拍摄负担较大。* <br>
-> *Tips：实拍开源数据集可以作为benchmark来测试AI model的降噪表现，但一般不直接用于训练集的构建。*
+| Model | Params | MACs | Latency ↓ | FPS ↑ |
+| --- | ---: | ---: | ---: | ---: |
+| Original UNet | 9.763 M | 24.143 G | 6.010 ms | 166.4 |
+| LiteUNet-v1 | 1.442 M | 3.323 G | 3.793 ms | 263.6 |
+| **LiteUNet-v2** | **0.373 M** | **0.920 G** | **2.833 ms** | **352.9** |
 
-#### 1.2 依据噪声模型合成匹配数据
-这里是一些关于RAW domain噪声模型的开源项目，你可以从这些介绍中了解更多关于噪声模型的知识。
+> Profiling/latency protocol: PyTorch FP32, batch=1, `1×4×256×256`, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 10 warm-up + 50 timed iterations。MAC 表示 multiply-accumulate；FLOPs 按 `2 × MACs` 统计。
 
- | Paper| Code|Noise Model |Year&lab|
- |:----:|:----:|:-------:|:-------:|
- |UPI|[code](https://github.com/timothybrooks/unprocessing)|   P + G      |CVPR 2019|
- |PMRID|[code](https://github.com/MegEngine/PMRID)       |   P’ + G     |ECCV 2020|
- |ELD|[code](https://github.com/Vandermode/ELD)|  P’ + TL |CVPR 2021|
- |Rethinking|[code](https://github.com/zhangyi-3/Noise-Synthesis) | P’ + Sample|ECCV 2022|
+| Parameters | MACs |
+| --- | --- |
+| ![Parameters comparison](assets/lightweight/params.png) | ![MACs comparison](assets/lightweight/macs.png) |
 
-> *优点：可以根据噪声模型合成任意数量的数据，可以用于训练。* <br>
-> *缺点：需要标定噪声模型，不合理的噪声模型直接导致降噪模型的表现不佳。* <br>
-> *Tips：应用ELD等先进的噪声模型可以提高极暗光（<1lux）场景下的信噪比和清晰度，本文不详细讨论不同噪声模型的优劣。*
+**核心结论：** LiteUNet-v1 在不缩减通道的情况下将参数量和 MACs 分别降低 85.2% 和 86.2%；LiteUNet-v2 进一步达到 96.2% 的参数量/MACs 降幅。本机 FP32 测试中，v2 的 latency 相对 Original UNet 降低 52.9%，FPS 提升至约 2.12 倍。
 
-#### 1.3 噪声标定
-噪声标定是指针对目标camera采集基准帧，计算均值方差等数据属性来拟合噪声分布，从而得到目标camera噪声模型的参数。本章采用一种普遍的RAW domain噪声模型，即Poisson-Gaussian噪声模型，具体操作如下。<br>
+## Project Background
 
-- ##### 采集一组基准黑帧
-![black](assets/black.jpg)
-> * 针对目标camera：手机摄像头realme-大师探索GT（sensor：IMX766），采集一组基准黑帧，如下图所示。
-> * 在暗室内将摄像头盖住避免进光照射，采集camera直出的RAW，其求均值得到黑电平。
-> * 采集的黑帧数量越多，平均后得到的黑电平越准确，通常可以将黑帧数量设置为5，本次实验为3。
+RAW 域去噪直接处理 Bayer 数据打包后的四个通道，避免过早进入 RGB/ISP 流程。上游 AISP 项目提供了 IMX766 数据准备、训练、验证和推理框架；本项目在其上聚焦一个明确问题：**经典 UNet 可以在保留 RAW I/O 与拓扑的情况下轻量化到什么程度？**
 
-- ##### 采集一组灰度帧
-![gray](assets/gray.jpg)
-> * 准备灰度卡，调整不同ISO进行拍摄，得到一组灰度帧，如上图所示。
-> * 采集的灰度帧数量越多，噪声分布越准确，通常可以采集5组不同ISO（如500~6400）档位。
-> * 需要确保不同ISO下的灰度帧数量相同，否则会导致噪声分布不准确。
-> * 适当调整环境光照和曝光，避免环境光照的变化导致灰度帧的曝光不一致。
+本项目保留上游 `model_zoo/Unet.py` 作为对照组，只修改新增模型与统一接入层。上游完整项目说明、数据制作方法与推理流程已归档到 [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md)。
 
-- ##### 标定参数
-  1. 通过基准黑帧得到黑电平，对拍摄到的灰度帧应用黑电平得到归一化的RAW。
-  2. 标定灰度帧的ROI区域，并且记录该区域的详细坐标，作为噪声分布的采样区域，如下图红框所示。
-      ![pipe](assets/ROI.jpg)
-  3. 不同ISO下的ROI均值作横轴，方差作纵轴，拟合一次函数得到斜率和截距，得到Poisson-Gaussian噪声模型中参数k和sigma，如下图所示。
-      ![pipe](assets/curve.jpg)
-  4. 拟合ISO和k及ISO和sigma的关系，得到噪声模型的参数配置文件。
-  5. 通过噪声模型参数配置文件，可以得到任意ISO下的噪声模型参数，从而可以合成匹配数据，该部分的code可参考`/utils/noise_profile.py`。
-  6. 由于已提前进行上述帧采集操作，通过运行以下code来直接生成配置文件。
+![Upstream AISP pipeline](assets/pipe.png)
 
-     ```python
-     python utils/noise_profile.py 
-     ```
-     运行code后生成如下yaml文件，即为噪声模型的参数配置文件。
-      ![pipe](assets/noise_profile.jpg)
+### Motivation
 
-#### 1.4 合成匹配数据
-成对的匹配数据需要标签图和输入图，首先需要对标签图进行采集。
-- ##### 采集标签图
-  标签图即干净的RAW图，可以通过以下方式获得：
-    - 用目标camera采集一组低ISO、长曝光的RAW图，如ISO100，曝光时间为1s。
-    - 用目标camera采集一组静止多帧的RAW图，如ISO100，曝光时间为1/10s，采集帧数为100，通过求平均得到干净的RAW图。
-    - 用开源数据集中的GT作标签，但需要对一些脏数据做一些传统滤波处理，本文采取该方式进行标签图像采集，完整数据链接请参考`./IMX766/data_here.txt`的内容进行下载。
+标准 UNet 依赖大量 3×3 convolution。随着通道从 32 增长至 512，网络的参数、显存访问和计算量迅速增加。对于手机 ISP、边缘 GPU 或其他实时成像系统，仅追求 PSNR 并不足够，还需要同时考虑：
 
-- ##### 应用噪声模型
-应用噪声模型时需注意ISO是可调的超参，尽可能广泛选取大范围的ISO来模拟高动态的噪声分布，如ISO范围可以选取100~6400。
+- 模型权重是否适合端侧存储；
+- 单帧推理是否满足实时预算；
+- 算子能否被常见部署后端支持；
+- 计算量下降是否真的转化为硬件延迟下降；
+- 轻量化后是否仍然保持 RAW-to-RAW 的工程接口。
 
-![pipe](assets/noise1.jpg)
-![pipe](assets/noise2.jpg)
+### Design goals
 
-> * 本实验选取ISO1000~6400来对每个patch加噪声得到与目标camera噪声分布匹配的带噪图，如图所示。 
-> * 加噪声需要经过一些归一化、pack等操作，该部分code可参考`./utils/tools.py`。
+本项目采用逐步消融，而不是一次性重写网络：
 
-- ##### 制作训练集和验证集
-为了加速训练集的数据读取以提高训练效率，本实验采用LMDB格式存储数据，通过运行以下code，可以将数据集转换为LMDB格式。
+1. **接口不变**：输入和输出始终是 `N×4×H×W`。
+2. **拓扑可比**：encoder、decoder、skip connection 和 residual output 保持一致。
+3. **变量隔离**：v1 只改变卷积形式；v2 再改变 channel width。
+4. **训练公平**：三个模型共享数据划分、超参数、随机种子和验证协议。
+5. **结果可追溯**：CSV 是图表和 README 表格的唯一结果来源。
+6. **上游兼容**：Original UNet 继续保留，可通过统一 registry 选择。
 
-```python
-python utils/make_dataset.py
-```
-> * 运行code后生成如下LMDB文件，即为训练集的LMDB文件，位于`./train_data/.mdb`下，需预留约20GB的存储空间。
-> * 运行code后同时生成训练集和验证集的ID文件，位于`./train_data/valid_data_idx.txt`下。
-> * 训练时，通过ID文件读取训练集LMDB和验证集的数据。
+### Scope
 
-## 2. 模型设计
-本节介绍AI model的选择和设计方式，将model作为噪声分布拟合器来实现噪声的预测和去除。
+当前开发只研究结构轻量化，没有混入 pruning、knowledge distillation、quantization-aware training 或 TensorRT 特定优化。因此结果可以更直接地反映 depthwise separable convolution 与 channel reduction 本身的影响。
 
-#### 2.1 开源模型
-AI降噪模型来源可以通过历年的NTIRE竞赛或者图像视觉会议（如CVPR、ECCV、AAAI等）获得，这里列举了一些开源的优秀降噪（或可适用于降噪）模型，部分code位于` ./model_zoo/`下。
+## LiteUNet-v1
 
- |Model|Paper                                                                             | Code                                                | Year & lab|Domain|
- |:----|:--------------------------------------------------------------------------------:|:---------------------------------------------------:|:---------:|:----:|
- |DnCNN|[paper](https://arxiv.org/pdf/1608.03981.pdf)                                     |[code](https://github.com/cszn/DnCNN)                |CVPR2017|RGB|
- |PMRID|[paper](https://www.ecva.net/papers/eccv_2020/papers_ECCV/papers/123510001.pdf)   |[code](https://github.com/MegEngine/PMRID )          |旷视 ECCV 2020 |RAW|
- |MPRNet|[paper](https://arxiv.org/abs/2102.02808.pdf)                                    |[code](https://github.com/swz30/MPRNet)              |UAE CVPR 2021|RGB|
- |Unprocessing|[paper](https://arxiv.org/abs/1811.11127)                                  |[code](https://github.com/timothybrooks/unprocessing)|Google CVPR 2019|RAW|
- |FFDNet|[paper](https://arxiv.org/abs/1710.04026)                                        |[code](https://github.com/cszn/FFDNet)               |NTIRE2018|RGB|
- |RIDNet|[paper](https://arxiv.org/abs/1904.07396)                                        |[code](https://github.com/saeed-anwar/RIDNet)        |NTIRE2019|RGB|
- |CycleISP|[paper](https://arxiv.org/abs/2003.07761)|[code](https://github.com/swz30/CycleISP)|UAE CVPR 2020|RAW|
- |GRDN|[paper](https://arxiv.org/abs/1905.11172)|[code](https://github.com/BusterChung/NTIRE_test_code)|CVPRW 2019|RGB|
- 
-#### 2.2 自研模型
-如果你想自己设计一个降噪模型，可以参考以下设计思路。
-- ##### 降噪模型的结构
-  - *降噪模型的输入是RAW图，输出是降噪后的RAW图，因此需要注意模型的输入输出通道数为4（不建议针对RGB进行AI NR）。*
-  - *需要注意的是backbone的参数量不能太大，否则会导致模型过于庞大，不利于部署。（计算量和参数都需要取舍）*
-  - *Network的选取需要注意尽可能避免一些不常见、效果存疑的算子。（如一些奇怪的act）*
-  - *对于某些算子的参数不宜设置过大或过小。（如Conv的kernel和channel应适中）*
-  - *尽可能添加一些已经被验证有效且易被量化的Block。（如C+B+R和residual等）*
-  - *可以添加一些已经被验证有效的注意力模块。（如SE、CBAM、SK、GC等）*
-- ##### 降噪模型的超参选取
-  - *降噪模型的loss function可以选择MSE或者L1，也可以选择一些其他的loss function（如SSIM、Charboinner）。*
-  - *可以选择一些已经被验证有效的训练策略（如Adam）。*
-  - *数据预处理可以选择一些已经被验证有效的数据增强策略（如随机裁剪、随机旋转、随机翻转等）。*
-  - *训练可以选择一些已经被验证有效的学习率策略（如warmup）。*
-- ##### 自研模型的结构
-基于以上经验，可以参考一些Unet类的结构来设计模型，基本组件为ResnetBlock2D和SelfAttnBlock2D，其中SelfAttnBlock2D选择Transformer来实现注意力模块，ResnetBlock2D选择C+R和residual等结构，详细的模型结构如下图所示。其中模型的源码位于`./model_zoo/My_network.py`下，该模型结构仅供参考。
+LiteUNet-v1 保持 Original UNet 的主通道宽度 `32 → 64 → 128 → 256 → 512`。
 
-![network](assets/My_network.jpg)
+修改 encoder/decoder 主干中的普通 3×3 Conv、downsample block 中 stride=1 的 3×3 Conv，以及 nearest-neighbor upsample 后的 3×3 projection。原有四级下采样/上采样、2×2 stride-2 convolution、skip connection、最终 1×1 output convolution、输入残差与 `4 → 4` RAW contract 均保留。
 
- > *Tips：针对2D NR可以考虑设置超参模式来控制去噪强度如（FFDNet系列），如将ISO作为先验输入network进行处理以实现非盲去噪（可以参考Stable diffusion的Unet设计ResnetBlock2D）。*
-- ##### 典型模型的参数
-  |Model|PSNR| SSIM| Macs|
-  |:----|:------:|:---:|:--:|
-  |MPRNet|43.133|0.979|8300 G|
-  |UNet|43.577|0.985|439 G|
-  |PMRID|42.967|0.981|37 G|
-  |NAFNet|-|-|2109 G|
-  |CycleISP|43.512|0.991|2653 G|
-  |Restormer|45.133|0.989|5400 G|
- > *Tips：PSNR和SSIM在ZTE验证集上的表现可以作为参考，其中Macs是FP32@1080P的推理量。*
+这使 v1 成为“只替换卷积算子”的独立消融组。
 
-## 3. 模型训练及验证
-本节实现AI model的训练和验证，测试其在验证集的表现。训练前请先确保你已经生成了训练集和验证集，如果没有，请参考[数据准备](#1-数据准备)一节。
+### Replacement policy
 
-#### 3.1 模型训练
-模型训练的入口文件为`./train_model/run.sh`，支持单机多卡训练，其调用的训练脚本为`./train_model/train.py`，。可以通过如下code开始训练。
+| Location | Original operator | LiteUNet-v1 operator | Reason |
+| --- | --- | --- | --- |
+| Encoder double-conv | 3×3 Conv | DW 3×3 + PW 1×1 | 主体计算来源 |
+| Bottleneck double-conv | 3×3 Conv | DW 3×3 + PW 1×1 | 高通道阶段参数最多 |
+| Decoder double-conv | 3×3 Conv | DW 3×3 + PW 1×1 | 保持 encoder/decoder 对称 |
+| Upsample projection | 3×3 Conv | DW 3×3 + PW 1×1 | 降低恢复分辨率时的计算 |
+| Downsample projection | 3×3 Conv | DW 3×3 + PW 1×1 | 保持原下采样路径 |
+| Stride-2 downsample | 2×2 Conv | 保留 | 不属于目标 3×3 Conv |
+| Output projection | 1×1 Conv | 保留 | 负责映射回 4-channel RAW |
 
-``` bash
-bash ./run.sh
+Depthwise 和 pointwise convolution 之间不额外插入新的 normalization、activation 或 attention，避免引入额外实验变量。ReLU 的位置与 Original UNet 的卷积块保持一致。
+
+## LiteUNet-v2
+
+LiteUNet-v2 在 v1 的算子基础上，将实际主通道整体减半：
+
+```text
+LiteUNet-v1: 32 → 64 → 128 → 256 → 512
+LiteUNet-v2: 16 → 32 →  64 → 128 → 256
 ```
 
-在你运行`./run.sh`之前，请先配置`training/train_config.yaml`文件，配置文件如下所示。
+v2 不改变网络深度、特征融合路径或输入输出，因此能够单独观察 width reduction 的额外收益。
+
+### Stage-by-stage widths
+
+| Stage | Original / v1 | v2 | Feature role |
+| --- | ---: | ---: | --- |
+| Encoder 1 | 32 | 16 | 高分辨率浅层 RAW 特征 |
+| Encoder 2 | 64 | 32 | 局部结构特征 |
+| Encoder 3 | 128 | 64 | 中层上下文 |
+| Encoder 4 | 256 | 128 | 低分辨率语义特征 |
+| Bottleneck | 512 | 256 | 最大感受野特征 |
+
+decoder 与对应 encoder 对称缩减，skip connection 拼接后的输入宽度也随之下降。最终输出层仍映射到 4 个 RAW 通道，因此数据读取、损失函数和验证代码无需针对 v2 特殊处理。
+
+## Depthwise Separable Convolution
+
+普通 3×3 convolution 同时进行空间提取与通道混合。Depthwise Separable Convolution 将它拆成两步：
+
+1. **Depthwise 3×3 Conv**：每个输入通道独立卷积，`groups = in_channels`。
+2. **Pointwise 1×1 Conv**：在通道维度上重新组合特征。
+
+```text
+Standard Conv:  H × W × Cin × Cout × K²
+DW + PW Conv:   H × W × (Cin × K² + Cin × Cout)
+```
+
+实现位于 `model_zoo/lightweight_blocks.py`，可单独复用于其他 RAW 网络。
+
+当 `Cin = Cout = 64`、kernel 为 3×3 时，每个空间位置的理论乘加次数为：
+
+
+
+```text
+Standard Conv = 64 × 64 × 9       = 36,864 MACs
+Depthwise     = 64 × 9            =    576 MACs
+Pointwise     = 64 × 64           =  4,096 MACs
+DW + PW       = 576 + 4,096       =  4,672 MACs
+Reduction     = 1 - 4,672/36,864  ≈ 87.3%
+```
+
+这个比例是单层理论值。完整网络还包含 1×1 输出、2×2 下采样以及不同尺寸的 feature map，因此最终整网降幅需要 profiling，而不能直接套用单层比例。
+
+### Why latency does not scale linearly with MACs
+
+MACs 是硬件无关的理论计数，latency 还受 memory access、kernel launch、并行度、算子融合和后端实现影响。Depthwise convolution 的计算密度通常低于标准 convolution，因此 86% 的 MACs 降幅并不保证 86% 的 GPU latency 降幅。这也是本项目同时报告 MACs 和真实 latency 的原因。
+
+## Channel Reduction
+
+卷积的计算和参数通常同时依赖输入、输出通道。主宽度减半后，大部分 pointwise/standard convolution 的规模接近原来的四分之一。因此，v2 在 v1 已完成算子分解的基础上，将总参数量进一步从 1.442 M 降至 0.373 M。
+
+该方法的风险是特征容量下降。是否值得采用不能只看 Params/MACs，还需要真实数据 PSNR/SSIM 与目标端 latency 共同判断。
+
+通道缩减对不同层的影响并不完全相同：浅层 feature map 分辨率大，缩减通道主要节省运行计算；bottleneck 分辨率较小但通道多，缩减后参数量下降尤其明显。v2 统一使用 0.5 width multiplier，便于解释和复现，没有为某一层单独搜索宽度。
+
+后续若需要进一步优化，可以将固定减半扩展为可配置 `width_multiplier`，例如 0.75、0.5、0.35，并在真实验证集上建立 Pareto frontier。但这些搜索结果不属于当前已报告实验。
+
+## Benchmark
+
+统一入口 `tools/benchmark_models.py` 完成 Params、MACs/FLOPs、CUDA/CPU latency/FPS、checkpoint 加载、PSNR/SSIM 验证、CSV 写入和 README 图生成。
+
+三份真实训练配置除模型名和输出目录外，其余设置完全相同：
+
+| Setting | Value |
+| --- | --- |
+| Dataset / split | Same IMX766 LMDB and fixed upstream split |
+| Epochs | 500 |
+| Batch size | 64 train / 1 validation |
+| Learning rate | 1e-4 |
+| Optimizer | Adam |
+| Scheduler | CosineAnnealingLR + warm-up |
+| Loss | L1 |
+| Random seed | 2023 |
+
+公平性可用 `python tools/train_lightweight_ablation.py --dry-run` 自动检查。
+
+### Profiling protocol
+
+- Params 统计全部可训练与不可训练 parameter elements；
+- MACs 通过每个 `nn.Conv2d` 的真实中间 shape 计算；
+- grouped/depthwise convolution 使用 `in_channels / groups` 修正单输出计算量；
+- FLOPs 采用常见的 `2 × MACs` 口径；
+- 默认 profile 输入为 `1×4×256×256`；
+- 三个模型在完全相同输入 shape 下执行。
+
+Original UNet 的 padding 行为也被轻量版保留，以免通过改变 padding 获得不公平的 MACs 优势。
+
+### Runtime protocol
+
+- 模型设置为 `eval()` 并使用 `torch.inference_mode()`；
+- GPU 计时前执行 10 次 warm-up；
+- 使用 CUDA Event 测量 50 次 forward 的平均耗时；
+- 每次输入 batch size 为 1；
+- 计时结束显式执行 CUDA synchronization；
+- FPS 按 `batch_size × 1000 / latency_ms` 计算；
+- 当前数字只代表所记录软硬件环境，不直接代表手机 NPU、CPU 或 TensorRT 性能。
+
+### Checkpoint and validation behaviour
+
+benchmark 会优先查找三个训练配置对应的 checkpoint。只有数据与权重同时存在时，脚本才会报告真实 validation PSNR/SSIM；没有真实数据时，必须显式传入 `--synthetic-eval` 才会执行 smoke experiment。脚本不会把随机初始化模型的质量指标静默写入正式结果。
+
+## Experimental Results
+
+### Architecture and runtime
+
+| Model | Params | Reduction | MACs | Reduction | Latency | FPS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original UNet | 9.763 M | — | 24.143 G | — | 6.010 ms | 166.4 |
+| LiteUNet-v1 | 1.442 M | 85.2% | 3.323 G | 86.2% | 3.793 ms | 263.6 |
+| LiteUNet-v2 | 0.373 M | 96.2% | 0.920 G | 96.2% | 2.833 ms | 352.9 |
+
+### Quality smoke test
+
+上游仓库没有附带 IMX766 LMDB 或三组训练权重。为验证“训练 → 验证 → 汇总 → 绘图”链路，随附 PSNR/SSIM 使用固定种子的微型 **synthetic RAW smoke ablation**：12 个训练样本、4 个验证样本、2 epochs、batch=4、Adam、CosineAnnealingLR 和 L1 loss。它不是相机数据集精度，不能用于正式效果排名。
+
+<!-- LIGHTWEIGHT_RESULTS_START -->
+| Model | Params | MACs | PSNR | SSIM | Latency | FPS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original UNet | 9.763 M | 24.143 G | 19.669 dB | 0.9138 | 6.010 ms | 166.4 |
+| LiteUNet-v1 | 1.442 M | 3.323 G | 15.013 dB | 0.7406 | 3.793 ms | 263.6 |
+| LiteUNet-v2 | 0.373 M | 0.920 G | 15.241 dB | 0.8926 | 2.833 ms | 352.9 |
+<!-- LIGHTWEIGHT_RESULTS_END -->
+
+| Synthetic PSNR | GPU latency |
+| --- | --- |
+| ![Synthetic PSNR comparison](assets/lightweight/psnr.png) | ![Latency comparison](assets/lightweight/latency.png) |
+
+![Synthetic PSNR versus latency](assets/lightweight/psnr_vs_latency.png)
+
+完整机器可读结果见 `artifacts/lightweight_ablation.csv`。理论计算量显著下降，但 GPU latency 降幅小于 MACs 降幅，说明 depthwise kernel 的实际效率具有硬件依赖性。正式结论应在真实 IMX766 数据完成三组同条件训练后更新。
+
+### Efficiency interpretation
+
+| Comparison | Params | MACs | Latency | FPS |
+| --- | ---: | ---: | ---: | ---: |
+| v1 vs Original | −85.2% | −86.2% | −36.9% | 1.58× |
+| v2 vs Original | −96.2% | −96.2% | −52.9% | 2.12× |
+| v2 vs v1 | −74.2% | −72.3% | −25.3% | 1.34× |
+
+v1 证明卷积分解本身能大幅缩减模型；v2 则表明在已经采用 depthwise separable convolution 后，channel width 仍然是重要的效率控制变量。另一方面，v1/v2 的 GPU latency 收益远小于理论计算收益，部署前仍需要在实际目标平台复测。
+
+### What can and cannot be concluded
+
+当前数据足以确认代码正确性、模型规模和本机运行效率，但不能确认真实图像质量排序。Synthetic PSNR/SSIM 只验证三个模型都能够反向传播、拟合和进入统一验证流程；2 个 epoch 的结果容易受到初始化与优化速度影响，不应据此宣称某个轻量模型在真实 RAW 去噪上更好。
+
+## Project Structure
+
+```text
+EdgeRAW-LiteUNet/
+├── model_zoo/
+│   ├── Unet.py                       # Original UNet
+│   ├── LiteUNet_v1.py                # depthwise-separable variant
+│   ├── LiteUNet_v2.py                # v1 + channel reduction
+│   ├── lightweight_blocks.py
+│   └── registry.py
+├── configs/lightweight/              # three fair training configs
+├── tools/
+│   ├── profile_models.py
+│   ├── benchmark_models.py
+│   ├── plot_lightweight_results.py
+│   └── train_lightweight_ablation.py
+├── tests/test_lightweight_models.py
+├── artifacts/lightweight_ablation.csv
+├── assets/lightweight/
+├── docs/UPSTREAM_README.md
+└── requirements-lightweight.txt
+```
+
+### Important files
+
+- `model_zoo/registry.py`：将人类可读模型名统一映射到 Python class；
+- `configs/lightweight/*.yaml`：三模型公平训练配置；
+- `tools/profile_models.py`：无需第三方 FLOPs 包即可统计模型复杂度；
+- `tools/benchmark_models.py`：统一质量与速度评测入口；
+- `artifacts/lightweight_ablation.csv`：所有 README 结果图的源数据；
+- `docs/UPSTREAM_README.md`：完整上游 AISP 文档和数据制作说明。
+
+## Quick Start
+
+### 1. Environment
+
+先安装与你的 CUDA/CPU 平台匹配的 PyTorch，然后安装其余依赖：
+
+```bash
+uv venv --python 3.11
+uv pip install -r requirements-lightweight.txt
+```
+
+如果只运行模型 forward test 与 profiling，只需要 PyTorch；真实 IMX766 数据加载和训练还需要 LMDB、rawpy、OpenCV、TensorBoard 等依赖。
+
+### 2. Forward test and profiling
+
+```bash
+python -m unittest tests.test_lightweight_models -v
+python tools/profile_models.py --input-shape 1 4 256 256
+```
+
+预期 profiling 输出：
+
+```text
+Original UNet  Params=   9.763 M  MACs=   24.143 G  FLOPs=   48.285 G
+LiteUNet-v1    Params=   1.442 M  MACs=    3.323 G  FLOPs=    6.646 G
+LiteUNet-v2    Params=   0.373 M  MACs=    0.920 G  FLOPs=    1.840 G
+```
+
+### 3. Reproduce the included smoke benchmark
+
+```bash
+python tools/benchmark_models.py --synthetic-eval --synthetic-epochs 2 --warmup 10 --repeats 50
+```
+
+运行后会更新：
+
+```text
+artifacts/lightweight_ablation.csv
+artifacts/lightweight_ablation.md
+assets/lightweight/params.png
+assets/lightweight/macs.png
+assets/lightweight/psnr.png
+assets/lightweight/latency.png
+assets/lightweight/psnr_vs_latency.png
+```
+
+### 4. Train on IMX766
+
+按照 [上游数据说明](docs/UPSTREAM_README.md#14-合成匹配数据) 准备 `IMX766/train_data`：
+
+```bash
+python tools/train_lightweight_ablation.py --dry-run
+python tools/train_lightweight_ablation.py --nproc-per-node 1
+python tools/benchmark_models.py
+```
+
+配置中的 `network` 支持：
+
 ```yaml
-    # train config
-    # -------------------- base_path config --------------------
-    log_dir: './training/logs'
-    checkpoint_dir: './training/checkpoints'
-    tensorboard_dir: './training/tensorboard'
-    valid_dir: './training/valid_data'
-
-    # -------------------- hyperparamters config --------------------
-    network: 'Unet'
-    learning_rate: 0.001
-    weight_decay: 0.00001
-    save_epoch: 10
-    criterion: 'l1'
-    optimizer: 'adam'
-    lr_scheduler: 'cosine'
-    train_batch_size: 64
-    train_epochs: 1000
-    train_num_workers: 1
-    valid_batch_size: 1
-    valid_num_workers: 1
-    print_step: 100
-    seed: 2023
-
-    # -------------------- bool type setting--------------------
-    use_quant: false #torch.fx maybe error
-    use_tensorboard: True
-    use_summarywriter: True
-    use_checkpoint: True
-    use_lr_scheduler: True
-    use_warm_up: True
-    use_logger: True
-
+network: "Original UNet"
+# network: "LiteUNet-v1"
+# network: "LiteUNet-v2"
 ```
-训练时的超参通过配置文件进行设置，其中：
-- `log_dir`、`checkpoint_dir`、`tensorboard_dir`、`valid_dir`分别为log、权重、tensorboard和验证集的存储路径，
-- `network`为模型的名称，`learning_rate`为学习率，`weight_decay`为权重衰减，`criterion`为loss function，`optimizer`为优化器，`lr_scheduler`为学习率策略，`train_batch_size`为训练batch size，`train_epochs`为训练epoch，`train_num_workers`为训练数据加载线程数，`valid_batch_size`为验证batch size，`print_step`为打印间隔。
-- `use_quant`、`use_tensorboard`、`use_summarywriter`、`use_warm_up`、`use_logger`为bool类型的配置，分别表示是否启用fx量化、tensorboard、summarywriter、warmup和logger。
-> *Tips: 你可以根据自己的需求修改配置文件，但是请确保配置文件的格式正确。*
 
-#### 3.2 模型验证
-对验证集进行测试来评估训练表现，code包含在`./train_model/train.py`中，会在训练自动启动验证。
-- 权重会保存在`./train_model/training/checkpoints`文件夹下，其中`xx_best.pth`为最优权重，`xx_last.pth`为最后一次训练的权重，默认不保存最后一次训练权重。
-- log会保存在`./train_model/training/log`文件夹下，打印详细的时间、训练step和loss等，如下图所示。
-  
-![pipe](assets/log.jpg)
+### 5. Use the model factory
 
-- tensorboard文件会保存在`./train_model/training/tensorboard`文件夹下，存储loss/iteration、PSNR、SSIM等验证时状态，如下图所示。
-
-![pipe](assets/tensorboard1.jpg)
-![pipe](assets/tensorboard2.jpg)
-![pipe](assets/tensorboard3.jpg)
-
-> *Tips: tensorboard需要打开浏览器才能查看，你可以通过`tensorboard --logdir=./train_model/training/tensorboard`命令来查看tensorboard。*
-
-
-## 4. 模型压缩及推理
-本节介绍AI model推理前的量化和压缩，实现模型压缩并以trt推理引擎进行推理以提高效率。
-#### 4.1 量化及推理
-对训练时FP32的模型进行量化有很多好处，如降低推理功耗、提高计算速度、减少内存和存储占用等。模型量化的对象为weights和act的FP32->INT8（即W8A8）。采用PTQ量化，入口文件为`./train_model/run.sh`，即已包含`./train_model/train.py`，通过配置文件的`use_quant：True`来选择是否fx量化，默认为False。
-**torch.fx量化后的模型为int8，但仅支持x86上INT8指令集的加速推理，若要实现GPU推理，可以考虑torch->onnx->tensorrt。**
-可以通过如下code来实现torch->onnx->trt的量化，Unet的onnx可视化如下图。
 ```python
-  python ./infer_model/inference.py
+import torch
+
+from model_zoo.registry import create_model
+
+model = create_model("LiteUNet-v2").eval()
+raw = torch.randn(1, 4, 256, 256)
+
+with torch.inference_mode():
+    denoised_raw = model(raw)
+
+assert denoised_raw.shape == raw.shape
 ```
 
-![pipe](assets/Unet_simplify.onnx.png)
+模型内部会沿用上游 UNet 的 padding/cropping 行为，因此输入高宽不需要手动裁剪为固定大小；forward test 也覆盖了非方形、非整除尺寸输入。
 
-同样，在你运行`./infer_model/inference.py`之前，请先配置`./infer_model/infer_config.yaml`文件，配置文件如下所示。
-```yaml
-# -------------------- base config --------------------
-network: 'Unet'
-ckpt_path: '/mnt/code/AISP_NR/train_model/training/checkpoints/Unet_best_ckpt.pth'
-onnx_path:  '/mnt/code/AISP_NR/infer_model/onnx/Unet_simplify.onnx'
-tensorrt_path: '/mnt/code/AISP_NR/infer_model/tensorrt/Unet.engine'
-input_shape :
-            - 1
-            - 4
-            - 128
-            - 128
-use_qtorch: False
-# -------------------- forward engine setting--------------------
-forward_engine: 'trt'  ## must be in ['trt', 'onnx', 'torch']
+## Reproducibility Checklist
 
-```
-其中：
-- `network`为模型的名称，`ckpt_path`为训练好的权重路径，`onnx_path`为转换后的onnx模型路径，`tensorrt_path`为转换后的trt模型路径，`input_shape`为输入的shape，`use_qtorch`为bool类型的配置，表示是否启用qtorch量化。
-- `forward_engine`为前向推理引擎，可以选择`trt`、`onnx`和`torch`，分别表示tensorrt、onnx和torch，其中`trt`和`onnx`需要先转换成相应的模型，`torch`表示直接使用torch进行推理。
-
-以下为不同推理框架推理同样的模型的时间对比，其中`trt`为tensorrt，`torch`为torch。
-| 模型 | trt |torch |分辨率|
-| :------: | :------: | :------: |  :------: |
-| Unet | 718.8 ms | 1907.7 ms | 3472×4624
-> *Tips: 推理设备 CPU：Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz，GPU：NVIDIA RTX-3090-24GB。*
-#### 4.2 Demo
-选择IMX766的一张图像进行测试，测试图例位于`./IMX766/test_data`文件夹下，输出图像保存在`./output`文件夹下，可以通过以下code进行推理。
-```python
-  python demo.py
-```
-输出图例如下所示。
-![pipe](assets/demo.jpg)
-![pipe](assets/demo2.jpg)
-> *Tips: 降噪后的图像质量有提高的空间，如降低图像的涂抹感，保持局部纹理一致性，恢复部分细节等，该部分trick可以通过对训练集进行增强或更改训练策略来实现，该文档不进一步讨论。*
-
-## 后记
-- AI-ISP的用途是逐步取代传统ISP链条上一些难以优化的模块如NR、HDR，以实现人眼观感提升或机器视觉指标的特定优化。
-- 当前主流的方案是用AI-ISP和传统算法共同作用于一个模块来保证其稳定性，也有一些paper希望用一个Network来实现整个ISP Pipe的替代，但目前还存在无法合理tuning及不稳定等缺陷。
-- AI-ISP model的应用通常是针对特定嵌入式硬件来将PC端侧的推理框架（如torch、tensorflow）转为平台自研的推理框架来实现OP的一一映射，中间可以会存在某些OP的优化和改写以实现良好的部署效果，所以也能接触一些硬件架构学习和部署相关的概念，个人认为有良好的学习前景，共勉！
-
-## License
-[MIT](https://choosealicense.com/licenses/mit/)
-感谢你的关注！
-如果你有任何问题，请联系我@HuiiJi。
+- [x] Original UNet 保留为对照；
+- [x] 三模型共享 RAW 4-channel I/O；
+- [x] v1 只替换目标 3×3 convolution；
+- [x] v2 只在 v1 上缩减主通道；
+- [x] 三份训练配置自动检查公平性；
+- [x] profiling 输入 shape 写入结果；
+- [x] latency 设备与协议写入 CSV/README；
+- [x] synthetic 与真实验证结果明确区分；
+- [x] 图表能够由 CSV 重新生成；
+- [ ] 完成真实 IMX766 三模型训练；
+- [ ] 补充目标移动端/NPU benchmark。
 
 
 
+## Acknowledgements
 
-
+本项目基于 [HuiiJi/AISP](https://github.com/HuiiJi/AISP) 二次开发。原项目关于 IMX766 RAW 数据、noise profiling、训练和推理的完整文档保存在 [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md)。
 

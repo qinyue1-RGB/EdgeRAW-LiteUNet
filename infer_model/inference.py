@@ -13,7 +13,7 @@ import torch
 import yaml
 from typing import Dict, Any, Tuple, Union, List
 from pathlib import Path
-import importlib
+from model_zoo.registry import create_model
 import onnxruntime
 import tensorrt as trt
 import pycuda.driver as cuda
@@ -73,9 +73,7 @@ class Inferencer():
         """
         set model
         """
-        m = self.args['network']
-        network_class = importlib.import_module(f'model_zoo.{m}')
-        network = getattr(network_class, m)() if hasattr(network_class, m) else None
+        network = create_model(self.args['network'])
         ckpt = torch.load(self.args['ckpt_path'])
         if self.args['use_qtorch']:
             qconfig = get_default_qconfig("fbgemm")
@@ -295,5 +293,4 @@ if __name__ == '__main__':
     print(output.shape, output.mean(), output.max(), output.min())
 
 
-    
     

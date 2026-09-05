@@ -1,0 +1,25 @@
+# Fair lightweight ablation: only `network` and output directories vary.
+log_dir: './artifacts/training/liteunet_v1/logs'
+checkpoint_dir: './artifacts/training/liteunet_v1/checkpoints'
+tensorboard_dir: './artifacts/training/liteunet_v1/tensorboard'
+valid_dir: './artifacts/training/liteunet_v1/valid_images'
+network: 'LiteUNet-v1'
+checkpoint:
+learning_rate: 0.0001
+weight_decay: 0.00001
+criterion: 'l1'
+optimizer: 'adam'
+lr_scheduler: 'cosine'
+train_batch_size: 64
+train_epochs: 500
+train_num_workers: 1
+valid_batch_size: 1
+valid_num_workers: 1
+print_step: 100
+seed: 2023
+use_quant: false
+use_tensorboard: true
+use_summarywriter: true
+use_lr_scheduler: true
+use_warm_up: true
+use_logger: true
