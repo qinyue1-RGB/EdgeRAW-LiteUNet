@@ -362,21 +362,6 @@ assert denoised_raw.shape == raw.shape
 
 模型内部会沿用上游 UNet 的 padding/cropping 行为，因此输入高宽不需要手动裁剪为固定大小；forward test 也覆盖了非方形、非整除尺寸输入。
 
-## Reproducibility Checklist
-
-- [x] Original UNet 保留为对照；
-- [x] 三模型共享 RAW 4-channel I/O；
-- [x] v1 只替换目标 3×3 convolution；
-- [x] v2 只在 v1 上缩减主通道；
-- [x] 三份训练配置自动检查公平性；
-- [x] profiling 输入 shape 写入结果；
-- [x] latency 设备与协议写入 CSV/README；
-- [x] synthetic 与真实验证结果明确区分；
-- [x] 图表能够由 CSV 重新生成；
-- [ ] 完成真实 IMX766 三模型训练；
-- [ ] 补充目标移动端/NPU benchmark。
-
-
 
 ## Acknowledgements
 
