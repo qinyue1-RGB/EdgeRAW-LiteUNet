@@ -246,9 +246,7 @@ benchmark 会优先查找三个训练配置对应的 checkpoint。只有数据�
 
 v1 证明卷积分解本身能大幅缩减模型；v2 则表明在已经采用 depthwise separable convolution 后，channel width 仍然是重要的效率控制变量。另一方面，v1/v2 的 GPU latency 收益远小于理论计算收益，部署前仍需要在实际目标平台复测。
 
-### What can and cannot be concluded
 
-当前数据足以确认代码正确性、模型规模和本机运行效率，但不能确认真实图像质量排序。Synthetic PSNR/SSIM 只验证三个模型都能够反向传播、拟合和进入统一验证流程；2 个 epoch 的结果容易受到初始化与优化速度影响，不应据此宣称某个轻量模型在真实 RAW 去噪上更好。
 
 ## Project Structure
 
